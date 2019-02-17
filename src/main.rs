@@ -1,19 +1,23 @@
+use actix_web::{
+    fs::{self, NamedFile},
+    server, App, HttpRequest,
+};
 use ring::{digest, pbkdf2};
 use serde_derive::Deserialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::{collections::HashMap, num::NonZeroU32};
 
 static DIGEST_ALG: &'static digest::Algorithm = &digest::SHA256;
 const CREDENTIAL_LEN: usize = digest::SHA256_OUTPUT_LEN;
 pub type Credential = [u8; CREDENTIAL_LEN];
 
-enum Error {
+pub enum Error {
     WrongUsernameOrPassword,
 }
 
-struct UserDatabase {
-    pbkdf2_iterations: NonZeroU32,
+pub struct UserDatabase {
+    pbkdf2_iterations: u32,
     db_salt_component: [u8; 16],
     storage: HashMap<String, Credential>,
 }
@@ -60,25 +64,64 @@ impl UserDatabase {
 
 #[derive(Deserialize)]
 struct Config {
-    pbkdf2_iterations: NonZeroU32,
+    pbkdf2_iterations: u32,
     db_salt_component: [u8; 16],
 }
 
-fn read_config_from_file() -> serde_json::Result<Config> {
-    let file = File::open("config.json").unwrap();
-    let reader = BufReader::new(file);
-    Ok(serde_json::from_reader(reader)?)
+impl Config {
+    fn from_file() -> serde_json::Result<Config> {
+        let file = File::open("config.json").unwrap();
+        let reader = BufReader::new(file);
+        Ok(serde_json::from_reader(reader)?)
+    }
+}
+
+struct ServerState {
+    db: UserDatabase,
+}
+
+fn index(_req: &HttpRequest<ServerState>) -> actix_web::Result<NamedFile> {
+    Ok(NamedFile::open("static/index.html")?)
 }
 
 fn main() {
-    let cfg = read_config_from_file().unwrap();
-    let mut db = UserDatabase {
-        pbkdf2_iterations: cfg.pbkdf2_iterations,
-        db_salt_component: cfg.db_salt_component,
-        storage: HashMap::new(),
-    };
+    println!("Starting server!");
+    server::new(move || {
+        let cfg = Config::from_file().unwrap();
+        let mut db = UserDatabase {
+            pbkdf2_iterations: cfg.pbkdf2_iterations,
+            db_salt_component: cfg.db_salt_component,
+            storage: HashMap::new(),
+        };
+        db.store_password("alice", "finkatt");
 
-    db.store_password("alice", "@74d7]404j|W}6u");
+        let state = ServerState { db };
+
+        let static_files =
+            fs::StaticFiles::new("static/").expect("Failed to create static files handler");
+
+        App::with_state(state)
+            .resource("/", |r| r.f(index))
+            .handler("/static", static_files)
+    })
+    .bind("localhost:8088")
+    .unwrap()
+    .run();
+
+    /*use std::io::{self, BufRead};
+    let stdin = io::stdin();
+    let mut it = stdin.lock().lines();
+    loop {
+        println!("Enter a username:");
+        let user = it.next().unwrap().expect("expected string");
+        println!("Enter a username:");
+        let password = it.next().unwrap().expect("expected string");
+        println!("User is {}.", user);
+        match db.verify_password(&user, &password).is_ok() {
+            true => println!("Login success!"),
+            false => println!("Login bad!"),
+        }
+    }*/
 }
 
 #[cfg(test)]
@@ -86,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
+    fn password_storage() {
         let cfg = read_config_from_file().unwrap();
         let mut db = UserDatabase {
             pbkdf2_iterations: cfg.pbkdf2_iterations,

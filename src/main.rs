@@ -1,9 +1,11 @@
+use actix::prelude::*;
 use actix_web::{
     fs::{self, NamedFile},
-    server, App, HttpRequest,
+    http, server, App, AsyncResponder, HttpMessage, HttpRequest, HttpResponse,
 };
+use futures::{future, Future};
 use ring::{digest, pbkdf2};
-use serde_derive::Deserialize;
+use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -76,32 +78,87 @@ impl Config {
     }
 }
 
+struct DbExecutor(UserDatabase);
+
+impl Actor for DbExecutor {
+    type Context = SyncContext<Self>;
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyLogin {
+    user: String,
+    password: String,
+}
+
+impl Message for VerifyLogin {
+    type Result = Result<bool, Error>;
+}
+
+impl Handler<VerifyLogin> for DbExecutor {
+    type Result = Result<bool, Error>;
+
+    fn handle(&mut self, msg: VerifyLogin, _: &mut Self::Context) -> Self::Result {
+        Ok(self.0.verify_password(&msg.user, &msg.password).is_ok())
+    }
+}
+
 struct ServerState {
-    db: UserDatabase,
+    db: Addr<DbExecutor>,
 }
 
 fn index(_req: &HttpRequest<ServerState>) -> actix_web::Result<NamedFile> {
     Ok(NamedFile::open("static/index.html")?)
 }
 
+#[derive(Debug, Deserialize)]
+struct LoginAttempt {
+    user: String,
+    password: String,
+}
+
+fn try_login(
+    req: HttpRequest<ServerState>,
+) -> Box<Future<Item = HttpResponse, Error = actix_web::Error>> {
+    req.json()
+        .from_err()
+        .and_then(move |val: VerifyLogin| {
+            println!("JSON: {:?}", val);
+            req.state()
+                .db
+                .send(val)
+                .from_err()
+                .and_then(|res| match res {
+                    Ok(success) => Ok(HttpResponse::Ok().json(success)),
+                    Err(_) => Ok(HttpResponse::InternalServerError().into()),
+                })
+        })
+        .responder()
+}
+
 fn main() {
     println!("Starting server!");
     server::new(move || {
         let cfg = Config::from_file().unwrap();
-        let mut db = UserDatabase {
-            pbkdf2_iterations: cfg.pbkdf2_iterations,
-            db_salt_component: cfg.db_salt_component,
-            storage: HashMap::new(),
-        };
-        db.store_password("alice", "finkatt");
 
-        let state = ServerState { db };
+        let addr = SyncArbiter::start(3, move || {
+            DbExecutor({
+                let mut db = UserDatabase {
+                    pbkdf2_iterations: cfg.pbkdf2_iterations,
+                    db_salt_component: cfg.db_salt_component,
+                    storage: HashMap::new(),
+                };
+                db.store_password("alice", "finkatt");
+                db
+            })
+        });
+        let state = ServerState { db: addr.clone() };
 
         let static_files =
             fs::StaticFiles::new("static/").expect("Failed to create static files handler");
 
         App::with_state(state)
             .resource("/", |r| r.f(index))
+            .route("/login", http::Method::POST, try_login)
             .handler("/static", static_files)
     })
     .bind("localhost:8088")
